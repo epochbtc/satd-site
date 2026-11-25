@@ -75,9 +75,7 @@ pub async fn start(config: &Config) -> Result<Running, StartError> {
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
     });
     Ok(Running {
@@ -85,4 +83,21 @@ pub async fn start(config: &Config) -> Result<Running, StartError> {
         state,
         server,
     })
+}
+
+/// Resolves on SIGINT or SIGTERM, so a service manager's stop lets
+/// requests in flight finish.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(term) => term,
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }

@@ -137,8 +137,42 @@ impl Config {
             path: path.to_owned(),
             source: Box::new(source),
         })?;
-        config.validate()?;
-        Ok(config)
+        config.finish()
+    }
+
+    /// Expand a leading `~/` in every path, then validate.
+    fn finish(mut self) -> Result<Self, ConfigError> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.expand_home(home.as_deref())?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Replace a leading `~/` in each configured path with `home`. Nothing
+    /// else is expanded: no `~user`, no environment variables.
+    pub fn expand_home(&mut self, home: Option<&Path>) -> Result<(), ConfigError> {
+        let expand = |path: &mut Option<PathBuf>| -> Result<(), ConfigError> {
+            let Some(p) = path.as_ref() else {
+                return Ok(());
+            };
+            let Ok(rest) = p.strip_prefix("~") else {
+                return Ok(());
+            };
+            let Some(home) = home else {
+                return Err(ConfigError::Invalid(format!(
+                    "{}: HOME is not set, so ~ cannot be expanded",
+                    p.display()
+                )));
+            };
+            *path = Some(home.join(rest));
+            Ok(())
+        };
+        expand(&mut self.static_dir)?;
+        for net in &mut self.networks {
+            expand(&mut net.rpc_cookie_file)?;
+            expand(&mut net.rpc_token_file)?;
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -163,9 +197,13 @@ impl Config {
                     net.name
                 ));
             }
-            if !(net.rpc_url.starts_with("http://") || net.rpc_url.starts_with("https://")) {
+            // The gateway is built without a TLS client: it is meant to sit
+            // on the node's host and reach it over loopback. An https URL
+            // would pass a looser check and then fail on every call.
+            if !net.rpc_url.starts_with("http://") {
                 return invalid(format!(
-                    "network {:?}: rpc_url must start with http:// or https://",
+                    "network {:?}: rpc_url must start with http:// (https is not supported; \
+                     run the gateway on the node's host)",
                     net.name
                 ));
             }
@@ -192,12 +230,63 @@ mod tests {
     use super::*;
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
-        let config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        let mut config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: "test".into(),
             source: Box::new(source),
         })?;
+        config.expand_home(Some(Path::new("/home/op")))?;
         config.validate()?;
         Ok(config)
+    }
+
+    #[test]
+    fn a_leading_tilde_is_expanded_in_every_path() {
+        let c = parse(
+            "static_dir = \"~/site\"\n[[network]]\nname=\"main\"\nrpc_url=\"http://a\"\nrpc_cookie_file=\"~/.bitcoin/.cookie\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.static_dir.unwrap(), Path::new("/home/op/site"));
+        assert_eq!(
+            c.networks[0].rpc_cookie_file.as_deref().unwrap(),
+            Path::new("/home/op/.bitcoin/.cookie")
+        );
+        // Only a leading `~` component: `~user` and a `~` further in stay.
+        let c = parse(
+            "[[network]]\nname=\"main\"\nrpc_url=\"http://a\"\nrpc_token_file=\"/etc/~x/~user\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.networks[0].rpc_token_file.as_deref().unwrap(),
+            Path::new("/etc/~x/~user")
+        );
+    }
+
+    #[test]
+    fn a_tilde_without_home_is_an_error() {
+        let mut c: Config = toml::from_str(
+            "[[network]]\nname=\"main\"\nrpc_url=\"http://a\"\nrpc_cookie_file=\"~/.cookie\"\n",
+        )
+        .unwrap();
+        let e = c.expand_home(None).unwrap_err();
+        assert!(e.to_string().contains("HOME"), "{e}");
+    }
+
+    /// The shipped example must load as it stands.
+    #[test]
+    fn the_example_config_is_valid() {
+        let text = include_str!("../../satd-site.example.toml");
+        let c = parse(text).unwrap();
+        assert_eq!(
+            c.networks[0].rpc_cookie_file.as_deref().unwrap(),
+            Path::new("/home/op/.bitcoin/.cookie")
+        );
+    }
+
+    #[test]
+    fn an_https_node_url_is_refused() {
+        let e =
+            parse("[[network]]\nname=\"main\"\nrpc_url=\"https://127.0.0.1:8332\"\n").unwrap_err();
+        assert!(e.to_string().contains("https is not supported"), "{e}");
     }
 
     #[test]
