@@ -1,0 +1,33 @@
+# satd-site gateway configuration. Unknown keys are an error.
+
+# Where the gateway listens. Keep it on loopback behind a TLS proxy.
+listen = "127.0.0.1:8080"
+
+# The built frontend (web/build). Without it only the JSON API is served.
+# static_dir = "web/build"
+
+# Proxies whose X-Forwarded-For is believed when limiting clients. A request
+# from any other peer is limited by its own address.
+trusted_proxies = ["127.0.0.1", "::1"]
+
+[limits]
+# A client is an IPv4 address or an IPv6 /64. `burst` requests at once,
+# refilled at `per_minute`. Over it: 429 with Retry-After.
+page = { per_minute = 60, burst = 30 }
+idle_secs = 600
+max_clients = 100000
+
+# One block per network served. `name` is main, signet, testnet4 or regtest.
+[[network]]
+name = "main"
+rpc_url = "http://127.0.0.1:8332"
+# A Core-style cookie file (read on every call), or a bearer token file.
+# Give the gateway a read-only credential: it only calls read-only methods.
+rpc_cookie_file = "~/.bitcoin/.cookie"
+# rpc_token_file = "/etc/satd-site/main.token"
+poll_secs = 5
+
+# [[network]]
+# name = "signet"
+# rpc_url = "http://127.0.0.1:38332"
+# rpc_cookie_file = "~/.bitcoin/signet/.cookie"
