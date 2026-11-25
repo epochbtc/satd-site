@@ -200,12 +200,24 @@ impl Config {
             // The gateway is built without a TLS client: it is meant to sit
             // on the node's host and reach it over loopback. An https URL
             // would pass a looser check and then fail on every call.
-            if !net.rpc_url.starts_with("http://") {
-                return invalid(format!(
-                    "network {:?}: rpc_url must start with http:// (https is not supported; \
-                     run the gateway on the node's host)",
-                    net.name
-                ));
+            match reqwest::Url::parse(&net.rpc_url) {
+                Ok(url) if url.scheme() == "http" && url.has_host() => {}
+                Ok(url) if url.scheme() == "https" => {
+                    return invalid(format!(
+                        "network {:?}: rpc_url must be an http:// URL (https is not supported; \
+                         run the gateway on the node's host)",
+                        net.name
+                    ));
+                }
+                Ok(_) => {
+                    return invalid(format!(
+                        "network {:?}: rpc_url must be an http:// URL with a host",
+                        net.name
+                    ));
+                }
+                Err(e) => {
+                    return invalid(format!("network {:?}: rpc_url: {e}", net.name));
+                }
             }
             if net.poll_secs == 0 {
                 return invalid(format!(
@@ -280,6 +292,30 @@ mod tests {
             c.networks[0].rpc_cookie_file.as_deref().unwrap(),
             Path::new("/home/op/.bitcoin/.cookie")
         );
+    }
+
+    /// `--check` must refuse a URL no call could be sent to.
+    #[test]
+    fn a_malformed_node_url_is_refused() {
+        for bad in [
+            "http://",
+            "http://:8332",
+            "http://127.0.0.1:port",
+            "http://[::1",
+            "ftp://127.0.0.1",
+        ] {
+            let text = format!("[[network]]\nname=\"main\"\nrpc_url=\"{bad}\"\n");
+            let e = parse(&text).unwrap_err();
+            assert!(e.to_string().contains("rpc_url"), "{bad}: {e}");
+        }
+        for good in [
+            "http://127.0.0.1:8332",
+            "http://[::1]:8332/",
+            "http://localhost:8332/wallet",
+        ] {
+            let text = format!("[[network]]\nname=\"main\"\nrpc_url=\"{good}\"\n");
+            parse(&text).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
     }
 
     #[test]
