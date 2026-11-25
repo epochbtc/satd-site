@@ -145,7 +145,24 @@ impl Config {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         self.expand_home(home.as_deref())?;
         self.validate()?;
+        self.check_files()?;
         Ok(self)
+    }
+
+    /// What must exist on disk for the configuration to work. The file
+    /// server looks a path up only when asked for it, so without this a
+    /// misspelt `static_dir` would start and answer 404 to every page.
+    pub fn check_files(&self) -> Result<(), ConfigError> {
+        if let Some(dir) = &self.static_dir {
+            let shell = dir.join("index.html");
+            if !shell.is_file() {
+                return Err(ConfigError::Invalid(format!(
+                    "static_dir: {} is not a file (build the frontend, or remove static_dir)",
+                    shell.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Replace a leading `~/` in each configured path with `home`. Nothing
@@ -292,6 +309,25 @@ mod tests {
             c.networks[0].rpc_cookie_file.as_deref().unwrap(),
             Path::new("/home/op/.bitcoin/.cookie")
         );
+    }
+
+    #[test]
+    fn a_static_dir_without_the_shell_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "static_dir = {:?}\n[[network]]\nname=\"main\"\nrpc_url=\"http://a\"\n",
+            dir.path()
+        );
+        let config = parse(&text).unwrap();
+        let e = config.check_files().unwrap_err();
+        assert!(e.to_string().contains("index.html"), "{e}");
+        std::fs::write(dir.path().join("index.html"), "x").unwrap();
+        config.check_files().unwrap();
+        // No static_dir at all is fine: the API is served alone.
+        parse("[[network]]\nname=\"main\"\nrpc_url=\"http://a\"\n")
+            .unwrap()
+            .check_files()
+            .unwrap();
     }
 
     /// `--check` must refuse a URL no call could be sent to.
