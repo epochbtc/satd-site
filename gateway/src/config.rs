@@ -247,6 +247,17 @@ impl Config {
         if page.per_minute == 0 || page.burst == 0 {
             return invalid("limits.page: per_minute and burst must be at least 1".into());
         }
+        // A bucket dropped as idle comes back full. If that could happen
+        // before an emptied bucket has refilled by itself, going quiet would
+        // be a way to get the burst back early, and at zero every sweep
+        // would empty the table.
+        let refill_secs = (u64::from(page.burst) * 60).div_ceil(u64::from(page.per_minute));
+        if self.limits.idle_secs < refill_secs.max(1) {
+            return invalid(format!(
+                "limits.idle_secs must be at least {} (the time an empty bucket takes to refill)",
+                refill_secs.max(1)
+            ));
+        }
         if self.limits.max_clients == 0 {
             return invalid("limits.max_clients must be at least 1".into());
         }
@@ -309,6 +320,23 @@ mod tests {
             c.networks[0].rpc_cookie_file.as_deref().unwrap(),
             Path::new("/home/op/.bitcoin/.cookie")
         );
+    }
+
+    #[test]
+    fn idle_secs_shorter_than_a_refill_is_refused() {
+        let net = "[[network]]\nname=\"main\"\nrpc_url=\"http://a\"\n";
+        let zero = format!("[limits]\nidle_secs = 0\n{net}");
+        assert!(parse(&zero).unwrap_err().to_string().contains("idle_secs"));
+        // 30 tokens at 60 a minute refill in 30 s.
+        let short = format!("[limits]\nidle_secs = 29\n{net}");
+        assert!(
+            parse(&short)
+                .unwrap_err()
+                .to_string()
+                .contains("at least 30")
+        );
+        let exact = format!("[limits]\nidle_secs = 30\n{net}");
+        parse(&exact).unwrap();
     }
 
     #[test]
