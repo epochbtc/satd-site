@@ -111,9 +111,12 @@ export function follow(network) {
 		}
 		if (!stopped) timer = setTimeout(poll, POLL_MS);
 	}
+	// The first poll comes when the snapshot the page was served with is
+	// due to be replaced. A visitor's clock that runs ahead or behind the
+	// gateway's cannot push it past one interval.
 	const fresh = site.status[network];
-	const age = fresh ? Date.now() / 1000 - fresh.fetched_at : Infinity;
-	timer = setTimeout(poll, age * 1000 < POLL_MS ? POLL_MS - age * 1000 : 0);
+	const ageMs = fresh ? Date.now() - fresh.fetched_at * 1000 : Infinity;
+	timer = setTimeout(poll, Math.min(POLL_MS, Math.max(0, POLL_MS - ageMs)));
 	return () => {
 		stopped = true;
 		clearTimeout(timer);

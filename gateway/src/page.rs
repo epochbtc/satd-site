@@ -54,6 +54,8 @@ pub enum PageError {
     },
     #[error("{path}: unknown marker __SATD_{name}__ (is the gateway older than the frontend?)")]
     UnknownSlot { path: PathBuf, name: String },
+    #[error("{path}: a symbolic link in the built frontend (copy the files in instead)")]
+    Symlink { path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,10 +84,11 @@ impl Template {
                 .filter(|s| after.starts_with(*s) && after[s.len()..].starts_with("__"))
                 .max_by_key(|s| s.len());
             let Some(slot) = known else {
-                // Shaped like a marker (`__SATD_name__`) but not one we know.
+                // Shaped like a marker (`__SATD_name__`, any letters, digits
+                // or underscores) but not one we know.
                 let word = after
                     .bytes()
-                    .take_while(|b| b.is_ascii_lowercase() || *b == b'_')
+                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
                     .count();
                 if let Some(end) = after[..word].find("__").filter(|e| *e > 0) {
                     return Err(PageError::UnknownSlot {
@@ -132,7 +135,9 @@ pub struct Pages {
 }
 
 impl Pages {
-    /// Read every `.html` file under `dir`.
+    /// Read every `.html` file under `dir`. `dir` itself may be a symbolic
+    /// link; anything under it may not, so a link loop cannot hang startup
+    /// and no page is read from outside `dir`.
     pub fn load(dir: &Path) -> Result<Self, PageError> {
         let mut pages = HashMap::new();
         let mut not_found = None;
@@ -143,8 +148,17 @@ impl Pages {
                 source,
             };
             for entry in std::fs::read_dir(&d).map_err(read)? {
-                let path = entry.map_err(read)?.path();
-                if path.is_dir() {
+                let entry = entry.map_err(read)?;
+                let path = entry.path();
+                // The entry's own type: a link is not followed.
+                let kind = entry.file_type().map_err(|source| PageError::Read {
+                    path: path.clone(),
+                    source,
+                })?;
+                if kind.is_symlink() {
+                    return Err(PageError::Symlink { path });
+                }
+                if kind.is_dir() {
                     stack.push(path);
                     continue;
                 }
@@ -485,6 +499,39 @@ mod tests {
     fn an_unknown_marker_is_refused_at_load() {
         let e = Template::parse("<b>__SATD_nope__</b>", &path()).unwrap_err();
         assert!(e.to_string().contains("__SATD_nope__"), "{e}");
+    }
+
+    #[test]
+    fn a_marker_with_digits_or_capitals_is_refused_too() {
+        for text in ["__SATD_v2_tip__", "__SATD_PEERS__", "x __SATD_height2__ y"] {
+            let e = Template::parse(text, &path()).unwrap_err();
+            assert!(matches!(e, PageError::UnknownSlot { .. }), "{text}: {e}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_under_the_build_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "x").unwrap();
+        Pages::load(dir.path()).unwrap();
+        // A loop would otherwise be walked for ever.
+        std::os::unix::fs::symlink(".", dir.path().join("loop")).unwrap();
+        let e = Pages::load(dir.path()).unwrap_err();
+        assert!(matches!(e, PageError::Symlink { .. }), "{e}");
+        std::fs::remove_file(dir.path().join("loop")).unwrap();
+        // A page from outside the build.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("x.html"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("x.html"), dir.path().join("about.html"))
+            .unwrap();
+        let e = Pages::load(dir.path()).unwrap_err();
+        assert!(matches!(e, PageError::Symlink { .. }), "{e}");
+        // The build directory itself may be a link.
+        std::fs::remove_file(dir.path().join("about.html")).unwrap();
+        let link = outside.path().join("build");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        Pages::load(&link).unwrap();
     }
 
     #[test]

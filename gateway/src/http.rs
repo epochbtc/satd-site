@@ -258,15 +258,23 @@ async fn frontend(
         return redirect(&format!("/{}", bare.trim_end_matches('/')));
     }
 
-    let is_page = frontend.pages.get(path).is_some();
-    // A built page is a template: it is only ever sent filled in.
-    if is_page || path.ends_with(".html") || !path.rsplit('/').next().unwrap_or("").contains('.') {
+    // Under /api/ but not a version this gateway serves: JSON, as the
+    // API's own misses are.
+    if path == "api" || path.starts_with("api/") {
         if let Some(limited) = over_limit(&state, peer, request.headers()) {
             return limited;
         }
-        if !is_page {
-            return not_found_page(&state, frontend, path);
+        return api_not_found().await;
+    }
+
+    if frontend.pages.get(path).is_some() || path.ends_with(".html") {
+        if let Some(limited) = over_limit(&state, peer, request.headers()) {
+            return limited;
         }
+        // A built page is a template: it is only ever sent filled in.
+        let Some(template) = frontend.pages.get(path) else {
+            return not_found_page(&state, frontend, path);
+        };
         let (network, page_name) = page::split_network(path);
         if state.network(network).is_none() {
             // Mainnet is the root; a gateway without it sends the root's
@@ -278,16 +286,18 @@ async fn frontend(
                 _ => not_found_page(&state, frontend, path),
             };
         }
-        let Some(template) = frontend.pages.get(path) else {
-            return not_found_page(&state, frontend, path);
-        };
         return render(&state, template, network, StatusCode::OK);
     }
 
-    // A script, stylesheet or image.
+    // Any other file of the build: a script, stylesheet or image. A
+    // directory is not listed or redirected, so `/_app` is a plain miss.
     let immutable = path.starts_with("_app/immutable/");
     let headers = request.headers().clone();
-    let mut response = match ServeDir::new(&frontend.dir).oneshot(request).await {
+    let mut response = match ServeDir::new(&frontend.dir)
+        .append_index_html_on_directories(false)
+        .oneshot(request)
+        .await
+    {
         Ok(r) => r.into_response(),
         Err(never) => match never {},
     };

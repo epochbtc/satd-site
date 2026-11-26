@@ -329,6 +329,7 @@ fn fixture_frontend() -> tempfile::TempDir {
     std::fs::create_dir_all(dir.path().join("_app/immutable")).unwrap();
     std::fs::write(dir.path().join("_app/immutable/app.js"), "console.log(1)").unwrap();
     std::fs::write(dir.path().join("favicon.svg"), "<svg/>").unwrap();
+    std::fs::write(dir.path().join("LICENSE"), "MIT").unwrap();
     dir
 }
 
@@ -425,10 +426,12 @@ async fn a_built_page_is_never_sent_unfilled() {
         assert!(body.contains("<title>not found</title>"), "{path}: {body}");
         assert!(!body.contains("__SATD_"), "{path}: {body}");
     }
-    // An API miss is JSON, not the page.
-    let (status, _, body) = get(gw.addr, "/api/v1/nope").await;
-    assert_eq!(status, 404);
-    assert!(body.starts_with('{'), "{body}");
+    // An API miss is JSON, not the page, under any version.
+    for path in ["/api/v1/nope", "/api", "/api/v2/regtest/status"] {
+        let (status, _, body) = get(gw.addr, path).await;
+        assert_eq!(status, 404, "{path}");
+        assert!(body.starts_with('{'), "{path}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -474,6 +477,17 @@ async fn the_apps_files_are_served_and_cached() {
     let (status, _, body) = get(gw.addr, "/_app/immutable/gone.js").await;
     assert_eq!(status, 404);
     assert!(body.contains("<title>not found</title>"), "{body}");
+    // A file without an extension is served like any other.
+    let (status, _, body) = get(gw.addr, "/LICENSE").await;
+    assert_eq!((status, body.as_str()), (200, "MIT"));
+    // A directory is a plain miss, not a listing or a redirect.
+    let r = no_redirects()
+        .get(format!("http://{}/_app", gw.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+    assert!(r.text().await.unwrap().contains("<title>not found</title>"));
 }
 
 #[tokio::test]
