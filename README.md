@@ -18,6 +18,37 @@ it against their own node.
 
 **Status:** early. Nothing here is ready to deploy yet.
 
+## Run the gateway
+
+```sh
+cp satd-site.example.toml satd-site.toml   # point it at your node
+cargo run -p satd-site -- --config satd-site.toml
+curl http://127.0.0.1:8080/api/v1/networks
+```
+
+`--check` validates the configuration and exits. The gateway calls only
+read-only node methods, so give it a read-only credential.
+
+| Route | Answers |
+|---|---|
+| `GET /healthz` | 200 while the process runs |
+| `GET /readyz` | 200 when every network's snapshot is fresh, else 503 |
+| `GET /api/v1/networks` | the networks served |
+| `GET /api/v1/{network}/status` | the node's tip, version, peers and uptime |
+
+Each `/api/` request is charged to its client: an IPv4 address or an IPv6
+/64. Over the limit the answer is 429 with `Retry-After`. Requests are
+answered from a snapshot the gateway refreshes on a timer and never reach
+the node; when the node is down the last snapshot is served, marked
+`stale`.
+
+## Develop
+
+```sh
+cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo deny check
+```
+
 ## Layout
 
 | Path | What |

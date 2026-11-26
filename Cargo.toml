@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["gateway"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/epochbtc/satd-site"
+rust-version = "1.93"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
