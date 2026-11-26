@@ -26,7 +26,12 @@ function walk(dir) {
 			problems.push(`${relative(root, path)}: a symbolic link (the gateway refuses these)`);
 			return [];
 		}
-		return stat.isDirectory() ? walk(path) : [path];
+		if (stat.isDirectory()) return walk(path);
+		if (!stat.isFile()) {
+			problems.push(`${relative(root, path)}: not a regular file (the gateway refuses these)`);
+			return [];
+		}
+		return [path];
 	});
 }
 

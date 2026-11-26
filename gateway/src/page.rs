@@ -4,8 +4,10 @@
 //! written as a marker, `__SATD_<name>__`. At startup the gateway reads each
 //! built page and splits it at its markers; a request fills them from the
 //! snapshot cache, so a visitor with script off reads the same numbers as
-//! one with it on. A marker this module does not know is a startup error:
-//! the frontend and the gateway disagree, and the page would show a gap.
+//! one with it on. The `__SATD_` prefix is reserved: anything a built page
+//! holds that starts with it and is not a marker this module knows is a
+//! startup error, since the frontend and the gateway disagree and a visitor
+//! would read the raw text.
 //!
 //! What fills a marker is HTML-escaped (or, for `data`, JSON escaped for a
 //! `<script>` element) and is never scanned for markers again.
@@ -52,10 +54,14 @@ pub enum PageError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path}: unknown marker __SATD_{name}__ (is the gateway older than the frontend?)")]
+    #[error(
+        "{path}: unknown marker __SATD_{name}__ (the __SATD_ prefix is reserved; is the gateway older than the frontend?)"
+    )]
     UnknownSlot { path: PathBuf, name: String },
     #[error("{path}: a symbolic link in the built frontend (copy the files in instead)")]
     Symlink { path: PathBuf },
+    #[error("{path}: not a regular file or directory")]
+    NotAFile { path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,22 +90,17 @@ impl Template {
                 .filter(|s| after.starts_with(*s) && after[s.len()..].starts_with("__"))
                 .max_by_key(|s| s.len());
             let Some(slot) = known else {
-                // Shaped like a marker (`__SATD_name__`, any letters, digits
-                // or underscores) but not one we know.
-                let word = after
-                    .bytes()
-                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                    .count();
-                if let Some(end) = after[..word].find("__").filter(|e| *e > 0) {
-                    return Err(PageError::UnknownSlot {
-                        path: path.to_owned(),
-                        name: after[..end].to_owned(),
-                    });
-                }
-                // Not a marker: keep the text and look past it.
-                parts.push(Part::Text(rest[..at + OPEN.len()].to_owned()));
-                rest = after;
-                continue;
+                // The prefix is reserved: whatever follows it, it is not
+                // text a visitor should read.
+                let shown: String = after
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && !matches!(c, '<' | '>' | '"' | '\''))
+                    .take(40)
+                    .collect();
+                return Err(PageError::UnknownSlot {
+                    path: path.to_owned(),
+                    name: shown.trim_end_matches('_').to_owned(),
+                });
             };
             let name = *slot;
             parts.push(Part::Text(rest[..at].to_owned()));
@@ -161,6 +162,10 @@ impl Pages {
                 if kind.is_dir() {
                     stack.push(path);
                     continue;
+                }
+                // A pipe or device would block the read below for ever.
+                if !kind.is_file() {
+                    return Err(PageError::NotAFile { path });
                 }
                 let Some(rel) = path
                     .strip_prefix(dir)
@@ -534,18 +539,42 @@ mod tests {
         Pages::load(&link).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn text_that_only_looks_like_a_marker_is_kept() {
+    fn a_pipe_in_the_build_is_refused_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "x").unwrap();
+        let fifo = dir.path().join("about.html");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // Reading the pipe would block until a writer came; the load must
+        // refuse it instead.
+        let e = Pages::load(dir.path()).unwrap_err();
+        assert!(matches!(e, PageError::NotAFile { .. }), "{e}");
+    }
+
+    #[test]
+    fn anything_with_the_reserved_prefix_is_refused() {
         for text in [
             "__SATD_",
             "__SATD_x",
             "__SATD___",
+            "__SATD_foo-bar__",
+            "__SATD_ __",
             "a __SATD_ b __SATD_height__",
+            "<b>__SATD_heightx__</b>",
         ] {
+            let e = Template::parse(text, &path()).unwrap_err();
+            assert!(matches!(e, PageError::UnknownSlot { .. }), "{text}: {e}");
+        }
+        // Text that only resembles it is kept.
+        for text in ["__SAT_height__", "_SATD_height__", "SATD_height"] {
             let t = Template::parse(text, &path()).unwrap();
             let site = SiteConfig::default();
-            let got = t.render(&Values::new(&embedded(&site, None)));
-            assert_eq!(got, text.replace("__SATD_height__", ""), "{text}");
+            assert_eq!(t.render(&Values::new(&embedded(&site, None))), text);
         }
     }
 
