@@ -238,6 +238,26 @@ fn redirect(to: &str) -> Response {
     response
 }
 
+/// A URL path with its `%XX` escapes decoded, or `None` if an escape is
+/// malformed or the result is not UTF-8.
+fn percent_decode(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hex = std::str::from_utf8(hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Everything outside `/api/` and the health routes: the built frontend.
 async fn frontend(
     State(state): State<Arc<AppState>>,
@@ -251,12 +271,18 @@ async fn frontend(
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let uri: Uri = request.uri().clone();
-    let path = uri.path().trim_start_matches('/');
+    let raw = uri.path().trim_start_matches('/');
 
     // One address per page: `/about/` is `/about`.
-    if let Some(bare) = path.strip_suffix('/') {
+    if let Some(bare) = raw.strip_suffix('/') {
         return redirect(&format!("/{}", bare.trim_end_matches('/')));
     }
+    // Every check below reads the path as the file server will, decoded:
+    // `/index%2ehtml` is `index.html` and must not reach it as a file.
+    let Some(decoded) = percent_decode(raw) else {
+        return not_found_page(&state, frontend, raw);
+    };
+    let path = decoded.as_str();
 
     // Under /api/ but not a version this gateway serves: JSON, as the
     // API's own misses are.
@@ -267,7 +293,7 @@ async fn frontend(
         return api_not_found().await;
     }
 
-    if frontend.pages.get(path).is_some() || path.ends_with(".html") {
+    if frontend.pages.get(path).is_some() || path.to_ascii_lowercase().ends_with(".html") {
         if let Some(limited) = over_limit(&state, peer, request.headers()) {
             return limited;
         }
@@ -349,6 +375,19 @@ mod tests {
     }
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn paths_are_decoded_as_the_file_server_decodes_them() {
+        assert_eq!(
+            percent_decode("index%2ehtml").as_deref(),
+            Some("index.html")
+        );
+        assert_eq!(percent_decode("a%2Fb%20c").as_deref(), Some("a/b c"));
+        assert_eq!(percent_decode("plain").as_deref(), Some("plain"));
+        assert_eq!(percent_decode("bad%2"), None);
+        assert_eq!(percent_decode("bad%zz"), None);
+        assert_eq!(percent_decode("bad%ff"), None);
     }
 
     #[test]

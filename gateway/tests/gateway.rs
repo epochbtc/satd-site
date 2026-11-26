@@ -420,6 +420,12 @@ async fn a_built_page_is_never_sent_unfilled() {
         "/nope",
         "/regtest/nope",
         "/signet",
+        // The file server decodes escapes; the page check must too.
+        "/index%2ehtml",
+        "/index%2Ehtml",
+        "/regtest%2fabout.html",
+        "/INDEX.HTML",
+        "/bad%zz",
     ] {
         let (status, _, body) = get(gw.addr, path).await;
         assert_eq!(status, 404, "{path}");
