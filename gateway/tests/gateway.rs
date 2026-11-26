@@ -516,6 +516,11 @@ async fn pages_are_charged_to_the_client_and_files_are_not() {
     let (status, headers, _) = get(gw.addr, "/regtest").await;
     assert_eq!(status, 429);
     assert!(headers.contains_key("retry-after"));
+    // Every rendered miss is charged too: a missing file, a template asked
+    // for by name, and a path whose escapes do not decode.
+    for path in ["/nope.js", "/index.html", "/x%zz"] {
+        assert_eq!(get(gw.addr, path).await.0, 429, "{path}");
+    }
 }
 
 /// The real build, when CI has made one: every page it holds is sent with

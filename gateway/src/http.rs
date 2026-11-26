@@ -280,6 +280,10 @@ async fn frontend(
     // Every check below reads the path as the file server will, decoded:
     // `/index%2ehtml` is `index.html` and must not reach it as a file.
     let Some(decoded) = percent_decode(raw) else {
+        // A rendered page like any other miss, and charged like one.
+        if let Some(limited) = over_limit(&state, peer, request.headers()) {
+            return limited;
+        }
         return not_found_page(&state, frontend, raw);
     };
     let path = decoded.as_str();

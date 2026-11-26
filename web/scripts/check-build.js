@@ -8,16 +8,25 @@
 // 2. Each page carries the markers the gateway fills, so a page the
 //    gateway cannot fill is caught here rather than in production.
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 const root = process.argv[2] ?? 'build';
+
+/** @type {string[]} */
+const problems = [];
 
 /** @param {string} dir @returns {string[]} */
 function walk(dir) {
 	return readdirSync(dir).flatMap((/** @type {string} */ name) => {
 		const path = join(dir, name);
-		return statSync(path).isDirectory() ? walk(path) : [path];
+		// The gateway refuses a symbolic link in the build; so does this.
+		const stat = lstatSync(path);
+		if (stat.isSymbolicLink()) {
+			problems.push(`${relative(root, path)}: a symbolic link (the gateway refuses these)`);
+			return [];
+		}
+		return stat.isDirectory() ? walk(path) : [path];
 	});
 }
 
@@ -26,8 +35,6 @@ const foreign = /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i;
 // data: URIs are inline and fetch nothing.
 const inline = /^data:/i;
 
-/** @type {string[]} */
-const problems = [];
 const files = walk(root);
 
 for (const file of files) {
