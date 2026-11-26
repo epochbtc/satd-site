@@ -42,10 +42,29 @@ pub struct Config {
     pub trusted_proxies: Vec<IpAddr>,
     #[serde(default)]
     pub limits: Limits,
+    /// Who runs the site, for its about page.
+    #[serde(default)]
+    pub site: SiteConfig,
     /// The networks served, in the order given. At least one.
     #[serde(rename = "network")]
     pub networks: Vec<NetworkConfig>,
 }
+
+/// What the site says about who runs it. Both are shown as plain text.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteConfig {
+    /// A name for whoever runs the site.
+    #[serde(default)]
+    pub operator: Option<String>,
+    /// How node operators can reach them: an address or a URL, shown as
+    /// text, never as a link.
+    #[serde(default)]
+    pub contact: Option<String>,
+}
+
+/// The longest `operator` or `contact` accepted.
+pub const SITE_TEXT_MAX: usize = 200;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +180,10 @@ impl Config {
                     shell.display()
                 )));
             }
+            // A page the gateway cannot fill is refused here, not served
+            // with gaps.
+            crate::page::Pages::load(dir)
+                .map_err(|e| ConfigError::Invalid(format!("static_dir: {e}")))?;
         }
         Ok(())
     }
@@ -240,6 +263,20 @@ impl Config {
                 return invalid(format!(
                     "network {:?}: poll_secs must be at least 1",
                     net.name
+                ));
+            }
+        }
+        for (key, value) in [
+            ("site.operator", &self.site.operator),
+            ("site.contact", &self.site.contact),
+        ] {
+            if let Some(v) = value
+                && (v.trim().is_empty()
+                    || v.len() > SITE_TEXT_MAX
+                    || v.chars().any(char::is_control))
+            {
+                return invalid(format!(
+                    "{key}: give 1 to {SITE_TEXT_MAX} bytes of text on one line, or leave it out"
                 ));
             }
         }
@@ -351,6 +388,11 @@ mod tests {
         assert!(e.to_string().contains("index.html"), "{e}");
         std::fs::write(dir.path().join("index.html"), "x").unwrap();
         config.check_files().unwrap();
+        // A page with a marker the gateway cannot fill is refused too.
+        std::fs::write(dir.path().join("about.html"), "__SATD_nope__").unwrap();
+        let e = config.check_files().unwrap_err();
+        assert!(e.to_string().contains("__SATD_nope__"), "{e}");
+        std::fs::remove_file(dir.path().join("about.html")).unwrap();
         // No static_dir at all is fine: the API is served alone.
         parse("[[network]]\nname=\"main\"\nrpc_url=\"http://a\"\n")
             .unwrap()
@@ -397,6 +439,27 @@ mod tests {
         assert_eq!(c.limits.page, default_page());
         assert_eq!(c.networks[0].poll_secs, 5);
         assert!(c.static_dir.is_none());
+    }
+
+    #[test]
+    fn site_text_must_be_one_short_line() {
+        let net = "[[network]]\nname=\"main\"\nrpc_url=\"http://a\"\n";
+        let ok = parse(&format!(
+            "[site]\noperator = \"A. Operator\"\ncontact = \"ops@example.org\"\n{net}"
+        ))
+        .unwrap();
+        assert_eq!(ok.site.operator.as_deref(), Some("A. Operator"));
+        for bad in [
+            "operator = \"\"".to_owned(),
+            "operator = \"  \"".to_owned(),
+            "contact = \"a\\nb\"".to_owned(),
+            format!("contact = \"{}\"", "x".repeat(SITE_TEXT_MAX + 1)),
+        ] {
+            let e = parse(&format!("[site]\n{bad}\n{net}")).unwrap_err();
+            assert!(e.to_string().contains("site."), "{bad}: {e}");
+        }
+        let e = parse(&format!("[site]\nowner = \"x\"\n{net}")).unwrap_err();
+        assert!(e.to_string().contains("owner"), "{e}");
     }
 
     #[test]

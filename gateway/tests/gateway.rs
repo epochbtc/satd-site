@@ -76,6 +76,7 @@ fn config(node: SocketAddr) -> Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         static_dir: None,
         trusted_proxies: vec![],
+        site: Default::default(),
         limits: Limits {
             page: Bucket {
                 per_minute: 6000,
@@ -303,25 +304,222 @@ async fn a_bearer_token_file_is_presented() {
     );
 }
 
-#[tokio::test]
-async fn the_frontend_is_served_with_its_shell_as_the_fallback() {
-    let (_node, node_addr) = fake_node().await;
+/// A small built frontend: the same files and markers `web/` builds, for
+/// one prefixed network (regtest) and the root.
+fn fixture_frontend() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("index.html"),
-        "<!doctype html><title>shell</title>",
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("app.js"), "console.log(1)").unwrap();
+    let page = |name: &str| {
+        format!(
+            r#"<!doctype html><html data-served="__SATD_served__"><title>{name}</title>
+<p data-fresh="__SATD_fresh__">block <b>__SATD_height__</b> with __SATD_peers__, up __SATD_uptime__</p>
+<p data-named="__SATD_named__">by __SATD_operator__; methods __SATD_methods__</p>
+<script type="application/json" id="satd-data">__SATD_data__</script></html>"#
+        )
+    };
+    for (file, name) in [
+        ("index.html", "main home"),
+        ("about.html", "main about"),
+        ("regtest.html", "regtest home"),
+        ("404.html", "not found"),
+    ] {
+        std::fs::write(dir.path().join(file), page(name)).unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("regtest")).unwrap();
+    std::fs::write(dir.path().join("regtest/about.html"), page("regtest about")).unwrap();
+    std::fs::create_dir_all(dir.path().join("_app/immutable")).unwrap();
+    std::fs::write(dir.path().join("_app/immutable/app.js"), "console.log(1)").unwrap();
+    std::fs::write(dir.path().join("favicon.svg"), "<svg/>").unwrap();
+    dir
+}
+
+fn no_redirects() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+async fn embedded(body: &str) -> Value {
+    let start = body.find(r#"id="satd-data">"#).unwrap() + r#"id="satd-data">"#.len();
+    let end = start + body[start..].find("</script>").unwrap();
+    serde_json::from_str(&body[start..end]).unwrap()
+}
+
+#[tokio::test]
+async fn a_page_is_sent_with_its_markers_filled_from_the_cache() {
+    let (_node, node_addr) = fake_node().await;
+    let dir = fixture_frontend();
+    let mut config = config(node_addr);
+    config.static_dir = Some(dir.path().to_owned());
+    config.site.operator = Some("Example <Ops>".into());
+    let gw = satd_site::start(&config).await.unwrap();
+    wait_for(gw.addr, "/api/v1/regtest/status", |s, _| s == 200).await;
+
+    let (status, headers, body) = get(gw.addr, "/regtest").await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+    assert_eq!(headers["cache-control"], "no-cache");
+    assert!(body.contains("<title>regtest home</title>"), "{body}");
+    assert!(body.contains(r#"data-served="regtest""#), "{body}");
+    assert!(body.contains(r#"data-fresh="live""#), "{body}");
+    assert!(
+        body.contains("block <b>150</b> with 10 peers, up 20 minutes"),
+        "{body}"
+    );
+    assert!(body.contains("by Example &lt;Ops&gt;"), "{body}");
+    assert!(
+        body.contains("methods getblockchaininfo, getnetworkinfo, uptime"),
+        "{body}"
+    );
+    assert!(!body.contains("__SATD_"), "{body}");
+    // What the node said beyond the projected fields is not in the page.
+    assert!(
+        !body.contains("203.0.113.7") && !body.contains("internal warning"),
+        "{body}"
+    );
+
+    let data = embedded(&body).await;
+    assert_eq!(data["network"], "regtest");
+    assert_eq!(data["networks"], json!(["regtest"]));
+    assert_eq!(data["status"]["node"]["height"], 150);
+    assert_eq!(data["site"]["operator"], "Example <Ops>");
+
+    let (status, _, body) = get(gw.addr, "/regtest/about").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("<title>regtest about</title>"), "{body}");
+}
+
+#[tokio::test]
+async fn a_page_before_the_node_answers_says_so() {
+    let (node, node_addr) = fake_node().await;
+    node.down.store(true, Ordering::SeqCst);
+    let dir = fixture_frontend();
     let mut config = config(node_addr);
     config.static_dir = Some(dir.path().to_owned());
     let gw = satd_site::start(&config).await.unwrap();
+    let (status, _, body) = get(gw.addr, "/regtest").await;
+    assert_eq!(status, 200);
+    assert!(body.contains(r#"data-fresh="none""#), "{body}");
+    assert!(body.contains("block <b></b>"), "{body}");
+    assert!(embedded(&body).await["status"].is_null());
+}
 
-    assert!(get(gw.addr, "/").await.2.contains("shell"));
-    assert_eq!(get(gw.addr, "/app.js").await.2, "console.log(1)");
-    // A client-side route gets the shell; an API miss does not.
-    assert!(get(gw.addr, "/network/software").await.2.contains("shell"));
+#[tokio::test]
+async fn a_built_page_is_never_sent_unfilled() {
+    let (_node, node_addr) = fake_node().await;
+    let dir = fixture_frontend();
+    let mut config = config(node_addr);
+    config.static_dir = Some(dir.path().to_owned());
+    let gw = satd_site::start(&config).await.unwrap();
+    for path in [
+        "/index.html",
+        "/regtest.html",
+        "/regtest/about.html",
+        "/404.html",
+        "/nope",
+        "/regtest/nope",
+        "/signet",
+    ] {
+        let (status, _, body) = get(gw.addr, path).await;
+        assert_eq!(status, 404, "{path}");
+        assert!(body.contains("<title>not found</title>"), "{path}: {body}");
+        assert!(!body.contains("__SATD_"), "{path}: {body}");
+    }
+    // An API miss is JSON, not the page.
     let (status, _, body) = get(gw.addr, "/api/v1/nope").await;
     assert_eq!(status, 404);
-    assert!(!body.contains("shell"));
+    assert!(body.starts_with('{'), "{body}");
+}
+
+#[tokio::test]
+async fn the_root_goes_to_the_first_network_when_mainnet_is_not_served() {
+    let (_node, node_addr) = fake_node().await;
+    let dir = fixture_frontend();
+    let mut config = config(node_addr);
+    config.static_dir = Some(dir.path().to_owned());
+    let gw = satd_site::start(&config).await.unwrap();
+    let client = no_redirects();
+    for (from, to) in [
+        ("/", "/regtest"),
+        ("/about", "/regtest/about"),
+        ("/regtest/", "/regtest"),
+        ("/regtest/about/", "/regtest/about"),
+    ] {
+        let r = client
+            .get(format!("http://{}{from}", gw.addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 302, "{from}");
+        assert_eq!(r.headers()["location"], to, "{from}");
+    }
+}
+
+#[tokio::test]
+async fn the_apps_files_are_served_and_cached() {
+    let (_node, node_addr) = fake_node().await;
+    let dir = fixture_frontend();
+    let mut config = config(node_addr);
+    config.static_dir = Some(dir.path().to_owned());
+    let gw = satd_site::start(&config).await.unwrap();
+    let (status, headers, body) = get(gw.addr, "/_app/immutable/app.js").await;
+    assert_eq!((status, body.as_str()), (200, "console.log(1)"));
+    assert_eq!(
+        headers["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    let (status, headers, _) = get(gw.addr, "/favicon.svg").await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "public, max-age=300");
+    let (status, _, body) = get(gw.addr, "/_app/immutable/gone.js").await;
+    assert_eq!(status, 404);
+    assert!(body.contains("<title>not found</title>"), "{body}");
+}
+
+#[tokio::test]
+async fn pages_are_charged_to_the_client_and_files_are_not() {
+    let (_node, node_addr) = fake_node().await;
+    let dir = fixture_frontend();
+    let mut config = config(node_addr);
+    config.static_dir = Some(dir.path().to_owned());
+    config.limits.page = Bucket {
+        per_minute: 1,
+        burst: 2,
+    };
+    config.limits.idle_secs = 120;
+    let gw = satd_site::start(&config).await.unwrap();
+    for _ in 0..5 {
+        assert_eq!(get(gw.addr, "/_app/immutable/app.js").await.0, 200);
+    }
+    assert_eq!(get(gw.addr, "/regtest").await.0, 200);
+    assert_eq!(get(gw.addr, "/regtest/about").await.0, 200);
+    let (status, headers, _) = get(gw.addr, "/regtest").await;
+    assert_eq!(status, 429);
+    assert!(headers.contains_key("retry-after"));
+}
+
+/// The real build, when CI has made one: every page it holds is sent with
+/// no marker left and with its data readable.
+#[tokio::test]
+async fn the_built_frontend_is_filled_in_on_every_page() {
+    let Some(build) = std::env::var_os("SATD_SITE_WEB_BUILD") else {
+        eprintln!("SATD_SITE_WEB_BUILD is not set; build web/ and set it to run this test");
+        return;
+    };
+    let (_node, node_addr) = fake_node().await;
+    let mut config = config(node_addr);
+    config.static_dir = Some(build.into());
+    config.check_files().unwrap();
+    let gw = satd_site::start(&config).await.unwrap();
+    wait_for(gw.addr, "/api/v1/regtest/status", |s, _| s == 200).await;
+    for path in ["/regtest", "/regtest/about", "/nope"] {
+        let (status, _, body) = get(gw.addr, path).await;
+        assert_eq!(status, if path == "/nope" { 404 } else { 200 }, "{path}");
+        assert!(!body.contains("__SATD_"), "{path}: {body}");
+        assert_eq!(embedded(&body).await["network"], "regtest", "{path}");
+        assert!(body.contains(r#"data-served="regtest""#), "{path}");
+    }
+    let (_, _, home) = get(gw.addr, "/regtest").await;
+    assert!(home.contains(r#">150</span>"#), "{home}");
+    assert!(home.contains("10 peers"), "{home}");
 }

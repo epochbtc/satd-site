@@ -9,6 +9,7 @@ pub mod config;
 pub mod http;
 pub mod limit;
 pub mod node;
+pub mod page;
 pub mod status;
 
 use std::net::SocketAddr;
@@ -21,6 +22,8 @@ use config::Config;
 pub enum StartError {
     #[error(transparent)]
     Node(#[from] node::NodeError),
+    #[error(transparent)]
+    Page(#[from] page::PageError),
     #[error("cannot listen on {addr}: {source}")]
     Listen {
         addr: SocketAddr,
@@ -37,6 +40,13 @@ pub struct Running {
 
 /// Bind, start one poller per network and the bucket sweeper, and serve.
 pub async fn start(config: &Config) -> Result<Running, StartError> {
+    let frontend = match &config.static_dir {
+        Some(dir) => Some(http::Frontend {
+            dir: dir.clone(),
+            pages: page::Pages::load(dir)?,
+        }),
+        None => None,
+    };
     let mut networks = Vec::new();
     for net in &config.networks {
         let client = node::NodeClient::new(net)?;
@@ -49,6 +59,8 @@ pub async fn start(config: &Config) -> Result<Running, StartError> {
         networks,
         limiter: limit::RateLimiter::new(config.limits.page, idle, config.limits.max_clients),
         trusted_proxies: config.trusted_proxies.clone(),
+        site: config.site.clone(),
+        frontend,
     });
     let sweeper = state.clone();
     tokio::spawn(async move {
@@ -69,7 +81,7 @@ pub async fn start(config: &Config) -> Result<Running, StartError> {
         addr: config.listen,
         source,
     })?;
-    let app = http::router(state.clone(), config.static_dir.as_deref());
+    let app = http::router(state.clone());
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
