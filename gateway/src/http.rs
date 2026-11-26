@@ -6,9 +6,11 @@
 //! | `GET /readyz` | 200 when every network has a fresh snapshot, else 503 |
 //! | `GET /api/v1/networks` | the networks served |
 //! | `GET /api/v1/{network}/status` | that network's node status snapshot |
-//! | anything else | a file of the built frontend, if one is configured |
+//! | `GET /`, `/about`, `/signet`, `/signet/about`, ... | a page of the built frontend, filled in from the cache ([`crate::page`]) |
+//! | `GET /_app/...` and other files | the built frontend's scripts, styles and images |
 //!
-//! Every `/api/` request is charged to its client's bucket. No request
+//! Every `/api/` request and every page is charged to its client's bucket;
+//! scripts and styles are not, since each page view needs them. No request
 //! reaches the node: handlers read the snapshot cache only.
 
 use std::net::{IpAddr, SocketAddr};
@@ -17,15 +19,21 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::header::{CACHE_CONTROL, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, LOCATION, REFERRER_POLICY, RETRY_AFTER,
+    X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::json;
-use tower_http::services::{ServeDir, ServeFile};
+use tower::ServiceExt as _;
+use tower_http::services::ServeDir;
 
+use crate::config::SiteConfig;
 use crate::limit::{ClientKey, Decision, RateLimiter};
+use crate::page::{self, Embedded, Pages, Values};
 use crate::status::StatusCache;
 
 #[derive(Debug)]
@@ -33,6 +41,15 @@ pub struct AppState {
     pub networks: Vec<Arc<StatusCache>>,
     pub limiter: RateLimiter,
     pub trusted_proxies: Vec<IpAddr>,
+    pub site: SiteConfig,
+    /// The built frontend, when one is configured.
+    pub frontend: Option<Frontend>,
+}
+
+#[derive(Debug)]
+pub struct Frontend {
+    pub dir: std::path::PathBuf,
+    pub pages: Pages,
 }
 
 impl AppState {
@@ -74,15 +91,11 @@ pub fn client_addr(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAddr]) -> IpA
     peer
 }
 
-async fn rate_limit(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let addr = client_addr(peer.ip(), request.headers(), &state.trusted_proxies);
+/// Charge one request to its client: `Some` is the 429 to send instead.
+fn over_limit(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> Option<Response> {
+    let addr = client_addr(peer.ip(), headers, &state.trusted_proxies);
     match state.limiter.check(ClientKey::from(addr)) {
-        Decision::Allowed => next.run(request).await,
+        Decision::Allowed => None,
         Decision::Limited { retry_after } => {
             let secs = retry_after.as_secs_f64().ceil().max(1.0) as u64;
             let mut response = (
@@ -93,8 +106,20 @@ async fn rate_limit(
             response
                 .headers_mut()
                 .insert(RETRY_AFTER, HeaderValue::from(secs));
-            response
+            Some(response)
         }
+    }
+}
+
+async fn rate_limit(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match over_limit(&state, peer, request.headers()) {
+        None => next.run(request).await,
+        Some(limited) => limited,
     }
 }
 
@@ -155,23 +180,189 @@ async fn api_not_found() -> Response {
     api_error(StatusCode::NOT_FOUND, "no such endpoint")
 }
 
-pub fn router(state: Arc<AppState>, static_dir: Option<&std::path::Path>) -> Router {
+fn html_response(status: StatusCode, html: String) -> Response {
+    let mut response = (status, html).into_response();
+    let h = response.headers_mut();
+    h.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    // Each view is filled from the cache at that moment.
+    h.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    // The pages carry their own policy for scripts and styles (a <meta>
+    // the frontend build writes); these are the parts a <meta> cannot set.
+    h.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'; base-uri 'self'; object-src 'none'"),
+    );
+    h.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    response
+}
+
+fn render(
+    state: &AppState,
+    template: &page::Template,
+    network: &str,
+    status: StatusCode,
+) -> Response {
+    let snapshot = state.network(network).and_then(|c| c.get());
+    let embedded = Embedded {
+        network,
+        networks: state.networks.iter().map(|n| n.network()).collect(),
+        site: &state.site,
+        methods: page::methods(),
+        status: snapshot.as_deref(),
+    };
+    html_response(status, template.render(&Values::new(&embedded)))
+}
+
+fn not_found_page(state: &AppState, frontend: &Frontend, path: &str) -> Response {
+    let Some(template) = frontend.pages.not_found() else {
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    };
+    let (network, _) = page::split_network(path);
+    let network = if state.network(network).is_some() {
+        network
+    } else {
+        state.networks.first().map_or("main", |n| n.network())
+    };
+    render(state, template, network, StatusCode::NOT_FOUND)
+}
+
+fn redirect(to: &str) -> Response {
+    let mut response = StatusCode::FOUND.into_response();
+    if let Ok(v) = HeaderValue::from_str(to) {
+        response.headers_mut().insert(LOCATION, v);
+    }
+    response
+}
+
+/// A URL path with its `%XX` escapes decoded, or `None` if an escape is
+/// malformed or the result is not UTF-8.
+fn percent_decode(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hex = std::str::from_utf8(hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Everything outside `/api/` and the health routes: the built frontend.
+async fn frontend(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> Response {
+    let Some(frontend) = &state.frontend else {
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    };
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let uri: Uri = request.uri().clone();
+    let raw = uri.path().trim_start_matches('/');
+
+    // One address per page: `/about/` is `/about`.
+    if let Some(bare) = raw.strip_suffix('/') {
+        return redirect(&format!("/{}", bare.trim_end_matches('/')));
+    }
+    // Every check below reads the path as the file server will, decoded:
+    // `/index%2ehtml` is `index.html` and must not reach it as a file.
+    let Some(decoded) = percent_decode(raw) else {
+        // A rendered page like any other miss, and charged like one.
+        if let Some(limited) = over_limit(&state, peer, request.headers()) {
+            return limited;
+        }
+        return not_found_page(&state, frontend, raw);
+    };
+    let path = decoded.as_str();
+
+    // Under /api/ but not a version this gateway serves: JSON, as the
+    // API's own misses are.
+    if path == "api" || path.starts_with("api/") {
+        if let Some(limited) = over_limit(&state, peer, request.headers()) {
+            return limited;
+        }
+        return api_not_found().await;
+    }
+
+    if frontend.pages.get(path).is_some() || path.to_ascii_lowercase().ends_with(".html") {
+        if let Some(limited) = over_limit(&state, peer, request.headers()) {
+            return limited;
+        }
+        // A built page is a template: it is only ever sent filled in.
+        let Some(template) = frontend.pages.get(path) else {
+            return not_found_page(&state, frontend, path);
+        };
+        let (network, page_name) = page::split_network(path);
+        if state.network(network).is_none() {
+            // Mainnet is the root; a gateway without it sends the root's
+            // pages to the first network it serves.
+            return match (network, state.networks.first()) {
+                ("main", Some(first)) => {
+                    redirect(&format!("/{}", page::page_path(first.network(), page_name)))
+                }
+                _ => not_found_page(&state, frontend, path),
+            };
+        }
+        return render(&state, template, network, StatusCode::OK);
+    }
+
+    // Any other file of the build: a script, stylesheet or image. A
+    // directory is not listed or redirected, so `/_app` is a plain miss.
+    let immutable = path.starts_with("_app/immutable/");
+    let headers = request.headers().clone();
+    let mut response = match ServeDir::new(&frontend.dir)
+        .append_index_html_on_directories(false)
+        .oneshot(request)
+        .await
+    {
+        Ok(r) => r.into_response(),
+        Err(never) => match never {},
+    };
+    if response.status() == StatusCode::NOT_FOUND {
+        if let Some(limited) = over_limit(&state, peer, &headers) {
+            return limited;
+        }
+        return not_found_page(&state, frontend, path);
+    }
+    if response.status().is_success() {
+        let cache = if immutable {
+            "public, max-age=31536000, immutable"
+        } else {
+            "public, max-age=300"
+        };
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static(cache));
+    }
+    response
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/networks", get(networks))
         .route("/{network}/status", get(status))
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit));
 
-    let mut app = Router::new()
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .nest("/api/v1", api);
-    if let Some(dir) = static_dir {
-        // The frontend is a single-page app: an unknown path gets its shell.
-        let files = ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html")));
-        app = app.fallback_service(files);
-    }
-    app.layer(middleware::from_fn(common_headers))
+        .nest("/api/v1", api)
+        .fallback(frontend)
+        .layer(middleware::from_fn(common_headers))
         .with_state(state)
 }
 
@@ -188,6 +379,19 @@ mod tests {
     }
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn paths_are_decoded_as_the_file_server_decodes_them() {
+        assert_eq!(
+            percent_decode("index%2ehtml").as_deref(),
+            Some("index.html")
+        );
+        assert_eq!(percent_decode("a%2Fb%20c").as_deref(), Some("a/b c"));
+        assert_eq!(percent_decode("plain").as_deref(), Some("plain"));
+        assert_eq!(percent_decode("bad%2"), None);
+        assert_eq!(percent_decode("bad%zz"), None);
+        assert_eq!(percent_decode("bad%ff"), None);
     }
 
     #[test]

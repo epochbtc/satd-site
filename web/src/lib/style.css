@@ -1,0 +1,180 @@
+/* Design tokens. The palette is the Operator Manual's code tour, so the
+   site and the manual read as one. Copper marks the one live thing on a
+   page (the tip); slate carries every other number. */
+:root {
+	--paper: #faf8f4;
+	--panel: #f2eee6;
+	--ink: #26221d;
+	--ink-soft: #5c554b;
+	--ink-faint: #7d7566;
+	--line: #ddd5c8;
+	--copper: #b4551f;
+	--slate: #41628a;
+	--warn: #a06a12;
+
+	--serif: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+	--mono: ui-monospace, 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
+
+	/* A modular scale on a 3:4 ratio from a 1.0625rem body. */
+	--step--1: 0.875rem;
+	--step-0: 1.0625rem;
+	--step-1: 1.4167rem;
+	--step-2: 1.8889rem;
+	--step-3: 2.5185rem;
+
+	--measure: 36rem;
+	--gutter: 1rem;
+	color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) {
+		--paper: #181613;
+		--panel: #201d18;
+		--ink: #e4ddd0;
+		--ink-soft: #ada589;
+		--ink-faint: #8a8174;
+		--line: #35312a;
+		--copper: #e0813f;
+		--slate: #8fb0d4;
+		--warn: #d4a95e;
+		color-scheme: dark;
+	}
+}
+:root[data-theme='dark'] {
+	--paper: #181613;
+	--panel: #201d18;
+	--ink: #e4ddd0;
+	--ink-soft: #ada589;
+	--ink-faint: #8a8174;
+	--line: #35312a;
+	--copper: #e0813f;
+	--slate: #8fb0d4;
+	--warn: #d4a95e;
+	color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+}
+
+body {
+	margin: 0;
+	background: var(--paper);
+	color: var(--ink);
+	font-family: var(--serif);
+	font-size: var(--step-0);
+	line-height: 1.6;
+	font-variant-numeric: lining-nums;
+}
+
+a {
+	color: inherit;
+	text-decoration-color: var(--line);
+	text-decoration-thickness: 1px;
+	text-underline-offset: 0.18em;
+}
+a:hover {
+	text-decoration-color: currentColor;
+}
+:focus-visible {
+	outline: 2px solid var(--slate);
+	outline-offset: 2px;
+	border-radius: 2px;
+}
+
+h1,
+h2 {
+	font-weight: 600;
+	line-height: 1.2;
+	letter-spacing: -0.005em;
+	margin: 0;
+}
+h1 {
+	font-size: var(--step-2);
+}
+h2 {
+	font-size: var(--step-1);
+}
+
+p {
+	margin: 0;
+}
+
+code,
+pre {
+	font-family: var(--mono);
+	font-size: 0.85em;
+}
+pre {
+	margin: 0;
+	overflow-x: auto;
+}
+
+.app {
+	display: contents;
+}
+
+/* SvelteKit's route announcer, read out to screen readers on navigation.
+   Its own inline style may be refused by the page's CSP; this keeps it off
+   screen either way. */
+#svelte-announcer {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+
+/* The page: one left-aligned column on a measure. */
+.page {
+	max-width: calc(var(--measure) + 2 * var(--gutter));
+	margin: 0 auto;
+	padding: 0 var(--gutter);
+	min-height: 100vh;
+	display: flex;
+	flex-direction: column;
+}
+.page > main {
+	flex: 1;
+}
+
+.flow > * + * {
+	margin-top: 1.25rem;
+}
+
+.prose {
+	color: var(--ink-soft);
+}
+
+.num {
+	color: var(--slate);
+	font-variant-numeric: lining-nums tabular-nums;
+	white-space: nowrap;
+}
+
+@media (min-width: 40rem) {
+	:root {
+		--gutter: 2rem;
+		--step-0: 1.125rem;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		transition-duration: 0.01ms !important;
+	}
+}

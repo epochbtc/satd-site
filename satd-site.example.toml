@@ -4,11 +4,17 @@
 listen = "127.0.0.1:8080"
 
 # The built frontend (web/build). Without it only the JSON API is served.
+# The pages are read at startup: restart the gateway after a new build.
 # static_dir = "web/build"
 
 # Proxies whose X-Forwarded-For is believed when limiting clients. A request
 # from any other peer is limited by its own address.
 trusted_proxies = ["127.0.0.1", "::1"]
+
+# Shown on the about page as plain text. Both optional.
+[site]
+# operator = "Your name or group"
+# contact = "an address or URL where node operators can reach you"
 
 [limits]
 # A client is an IPv4 address or an IPv6 /64. `burst` requests at once,
